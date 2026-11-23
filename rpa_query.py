@@ -15,7 +15,6 @@ from pywinauto import Desktop
 from pywinauto.timings import TimeoutError as WaitTimeout, wait_until_passes
 
 PORTAL = "https://enlinea.sunedu.gob.pe/"
-OPCION_GRADOS = "Verifica si estás inscrito en el Registro Nacional de Grados y Títulos"
 
 
 class RpaError(Exception):
@@ -121,10 +120,10 @@ def controles(window):
         raise RpaError("No se pudo leer la ventana de Chrome. Mantén la sesión de Windows desbloqueada.") from None
 
 
-def texto_visible(window):
+def texto_visible(window, incluir_fuera_de_pantalla=False):
     lines = []
     for control in controles(window):
-        if control.element_info.control_type in ("Text", "DataItem") and control.is_visible():
+        if control.element_info.control_type in ("Text", "DataItem") and (incluir_fuera_de_pantalla or control.is_visible()):
             text = control.window_text().strip()
             if text and (not lines or lines[-1] != text):
                 lines.append(text)
@@ -200,24 +199,42 @@ def pulsar(window, control):
     pyautogui.click(rectangle.mid_point().x, rectangle.mid_point().y)
 
 
-def consultar_rpa(dni):
+def consultar_rpa(dni, cerrar_al_terminar=False):
     if len(dni) != 8 or not dni.isascii() or not dni.isdigit():
         raise RpaError("El DNI debe contener ocho dígitos.")
     # Un perfil separado evita que Chrome delegue en una instancia ya abierta
     # que haya ignorado la opción de accesibilidad del nuevo proceso.
     profile = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "BOT_SUNEDU" / "ChromeRPA"
+    desktop = Desktop(backend="uia")
+    anteriores = {window.handle for window in desktop.windows(class_name="Chrome_WidgetWin_1")}
     subprocess.Popen([
         str(buscar_chrome()), f"--user-data-dir={profile}", "--new-window",
         "--force-renderer-accessibility", "--no-first-run", PORTAL,
     ])
-    comprobar_conexion_cloudflare()
-    desktop = Desktop(backend="uia")
+    seleccionada = {}
+    try:
+        comprobar_conexion_cloudflare()
+        return consultar_formulario(dni, desktop, anteriores, seleccionada)
+    finally:
+        if cerrar_al_terminar and "window" in seleccionada:
+            try:
+                seleccionada["window"].close()
+            except Exception:
+                print("[Chrome] La ventana del lote no pudo cerrarse automáticamente.", file=sys.stderr)
+
+
+def consultar_formulario(dni, desktop, anteriores, seleccionada):
     navigation = {"clicked": False, "aplicativo": False}
 
     def encontrar_formulario():
         for candidate in desktop.windows(class_name="Chrome_WidgetWin_1"):
+            if candidate.handle in anteriores:
+                continue
+            if "window" in seleccionada and candidate.handle != seleccionada["window"].handle:
+                continue
             if "SUNEDU" not in candidate.window_text().upper():
                 continue
+            seleccionada["window"] = candidate
             page_controls = controles(candidate)
             field = campo_dni(page_controls)
             if field is not None and field.is_visible() and field.is_enabled():
@@ -251,20 +268,21 @@ def consultar_rpa(dni):
     esperar_cloudflare(window)
     button = esperar(lambda: encontrar_buscar(window) or encontrar_buscar_visual(window), 15,
                      "La validación terminó, pero no se identificó un único control Buscar visible y habilitado.")
-    before = texto_visible(window)
+    before = texto_visible(window, incluir_fuera_de_pantalla=True)
     if isinstance(button, tuple):
         pyautogui.click(*button)
     else:
         pulsar(window, button)
     print("[Chrome] Buscar pulsado. Esperando resultados.", file=sys.stderr)
     def obtener_resultado():
-        text = texto_visible(window)
+        text = texto_visible(window, incluir_fuera_de_pantalla=True)
         lower = "".join(character for character in unicodedata.normalize("NFD", text.casefold()) if not unicodedata.combining(character))
         if "no se encontraron resultados" in lower:
             return "SUNEDU no encontro resultados para la consulta."
         if "verificaci" in lower and ("fallida" in lower or "debe completar" in lower):
             raise RpaError("SUNEDU informa que la validacion de seguridad no fue completada.")
-        if text != before and any(label in lower for label in ("fecha de diploma", "fecha de expedici", "fecha de inscripci", "fecha de resoluci", "fecha de emision")):
+        documento_confirmado = re.search(rf"\bDNI\s*:?\s*{re.escape(dni)}\b", text, re.IGNORECASE)
+        if documento_confirmado and text != before and any(label in lower for label in ("fecha de diploma", "fecha de expedici", "fecha de inscripci", "fecha de resoluci", "fecha de emision")):
             return text
         return None
 
