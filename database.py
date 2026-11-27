@@ -95,35 +95,60 @@ class SqlStore:
             """, fila[2]).fetchone()
             if not documento or str(documento[0]).strip() != dni:
                 raise RuntimeError('El documento de la petición cambió')
-            for grado in grados:
-                valores = (grado.get('Grado o título'), fecha_sql(grado.get('Fecha de diploma')),
-                           fecha_sql(grado.get('Fecha matrícula')), fecha_sql(grado.get('Fecha egreso')),
-                           grado.get('Institución'), fila[2])
-                if not valores[0] or not valores[4]:
-                    raise ValueError('Falta título o institución para identificar el grado')
-                existentes = con.execute("""
-                    SELECT ID_SUNEDU, DIPLFEC FROM dbo.SUNEDU_V2 WITH (UPDLOCK, HOLDLOCK)
-                    WHERE ID_PERSONA = ? AND GRADTITU = ? AND UNIVERSIDAD = ?
-                """, fila[2], valores[0], valores[4]).fetchall()
-                if len(existentes) > 1:
-                    existentes = [r for r in existentes if r[1] == valores[1]]
-                    if len(existentes) != 1:
-                        raise ValueError('Varios registros coinciden con el grado; revisar duplicados')
-                if existentes:
-                    con.execute("""
-                        UPDATE dbo.SUNEDU_V2 SET GRADTITU = ?, DIPLFEC = ?, MATRIFEC = ?,
-                            EGRESFEC = ?, UNIVERSIDAD = ?, ULTIMA_FECHA = GETDATE()
-                        WHERE ID_SUNEDU = ?
-                    """, *valores[:5], existentes[0][0])
-                else:
-                    con.execute("""
-                        INSERT dbo.SUNEDU_V2
-                        (GRADTITU, DIPLFEC, MATRIFEC, EGRESFEC, UNIVERSIDAD, ID_PERSONA, ULTIMA_FECHA)
-                        VALUES (?, ?, ?, ?, ?, ?, GETDATE())
-                    """, *valores)
+            self.guardar_grados(con, fila[2], grados)
             con.execute("""
                 UPDATE dbo.PETICIONES_SUNEDU SET FLAG = 1 WHERE ID_PETICION = ?
             """, solicitud)
+
+    def guardar_grados(self, con, id_persona, grados):
+        for grado in grados:
+            valores = (grado.get('Grado o título'), fecha_sql(grado.get('Fecha de diploma')),
+                       fecha_sql(grado.get('Fecha matrícula')), fecha_sql(grado.get('Fecha egreso')),
+                       grado.get('Institución'), id_persona)
+            if not valores[0] or not valores[4]:
+                raise ValueError('Falta título o institución para identificar el grado')
+            existentes = con.execute("""
+                SELECT ID_SUNEDU, DIPLFEC FROM dbo.SUNEDU_V2 WITH (UPDLOCK, HOLDLOCK)
+                WHERE ID_PERSONA = ? AND GRADTITU = ? AND UNIVERSIDAD = ?
+            """, id_persona, valores[0], valores[4]).fetchall()
+            if len(existentes) > 1:
+                existentes = [r for r in existentes if r[1] == valores[1]]
+                if len(existentes) != 1:
+                    raise ValueError('Varios registros coinciden con el grado; revisar duplicados')
+            if existentes:
+                con.execute("""
+                    UPDATE dbo.SUNEDU_V2 SET GRADTITU = ?, DIPLFEC = ?, MATRIFEC = ?,
+                        EGRESFEC = ?, UNIVERSIDAD = ?, ULTIMA_FECHA = GETDATE()
+                    WHERE ID_SUNEDU = ?
+                """, *valores[:5], existentes[0][0])
+            else:
+                con.execute("""
+                    INSERT dbo.SUNEDU_V2
+                    (GRADTITU, DIPLFEC, MATRIFEC, EGRESFEC, UNIVERSIDAD, ID_PERSONA, ULTIMA_FECHA)
+                    VALUES (?, ?, ?, ?, ?, ?, GETDATE())
+                """, *valores)
+
+    def siguiente_fondo(self):
+        with self.conexion() as con:
+            fila = con.execute('EXEC dbo.SP_OBTENERDNI_SUELDO').fetchone()
+            if fila is None:
+                fila = con.execute('EXEC dbo.SP_OBTENERDNI_DNI').fetchone()
+            return (int(fila[0]), str(fila[1]).strip()) if fila else None
+
+    def finalizar_fondo(self, dni_id, dni, grados):
+        with self.conexion() as con:
+            documento = con.execute('SELECT DNI, PROCESADO_SUNEDU FROM dbo.DNI WITH (UPDLOCK, HOLDLOCK) WHERE ID = ?', dni_id).fetchone()
+            if not documento or str(documento[0]).strip() != dni:
+                raise ValueError('Documento de fondo cambiado o inexistente')
+            if documento[1] == 1:
+                return
+            personas = con.execute('SELECT ID FROM dbo.PERSONA WHERE DNI = ? ORDER BY ID', dni_id).fetchall()
+            if not personas:
+                raise ValueError('No existe PERSONA asociada al documento de fondo')
+            for persona in personas:
+                self.guardar_grados(con, persona[0], grados)
+            con.execute('EXEC dbo.SP_ACTUALIZAR_PROCES0_DNI @DniId = ?', dni_id)
+
 
 
 def fecha_sql(valor):

@@ -18,16 +18,24 @@ class ConsultaCamoufoxError(Exception):
 
 
 def interpretar_respuesta(data, dni):
-    if not isinstance(data, dict) or data.get("bSuccess") is not True:
-        mensaje = str(data.get('sMessage') or '').lower() if isinstance(data, dict) else ''
-        causa = 'Respuesta rechazada por SUNEDU; no se confirmó ausencia de grados.'
-        if any(t in mensaje for t in ('captcha', 'turnstile', 'token', 'autoriz', 'sesión', 'sesion')):
-            causa = 'SUNEDU rechazó la validación o autenticación de la consulta.'
-        elif any(t in mensaje for t in ('no se encontr', 'no cuenta con', 'no registra')):
-            causa = 'SUNEDU informó que no encontró información, pero devolvió bSuccess=false.'
-        elif any(t in mensaje for t in ('intente', 'inténtelo', 'disponible', 'servicio')):
-            causa = 'SUNEDU informó un problema de disponibilidad del servicio.'
-        raise ConsultaCamoufoxError(causa)
+    if not isinstance(data, dict):
+        raise ConsultaCamoufoxError("La respuesta de SUNEDU no tiene un formato válido.")
+
+    if data.get("bSuccess") is not True:
+        mensaje = str(data.get("sMessage") or "").casefold()
+
+        if "no se encontraron resultados con este número de dni" in mensaje:
+            return {
+                "grados": [],
+                "oData": {},
+                "avisos": [],
+            }
+
+        raise ConsultaCamoufoxError(
+            "SUNEDU rechazó la consulta o no confirmó que no hubiera resultados."
+        )
+
+
     source = data.get("oData")
     if not isinstance(source, dict):
         raise ConsultaCamoufoxError("La respuesta no contiene oData válido.")
@@ -178,6 +186,16 @@ async def consultar(numero, dni, browser):
                 data = await response.json()
             except ValueError:
                 raise ConsultaCamoufoxError("La respuesta no es JSON válido.") from None
+            if isinstance(data, dict) and data.get("bSuccess") is not True:
+                try:
+                    aviso = (await frame.locator("body").inner_text(timeout=3000)).casefold()
+                except TimeoutError:
+                    aviso = ""
+                if "no se encontraron resultados con este número de dni" in aviso:
+                    data = {
+                        "bSuccess": True,
+                        "oData": {"GradosNacionales": [], "GradosExtranjeros": []},
+                    }
             etapa = 'interpretar JSON'
             resultado["resultado"] = interpretar_respuesta(data, dni)
             registrar(numero, f"JSON interpretado: {len(resultado['resultado']['grados'])} grados.")

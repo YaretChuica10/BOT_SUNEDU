@@ -3,6 +3,7 @@
 import asyncio
 import re
 import signal
+import sys
 from time import monotonic
 from uuid import uuid4
 
@@ -31,8 +32,8 @@ class Ventanas:
             await contexto.close()
             raise
 
-    async def preparar(self):
-        for _ in range(3):
+    async def preparar(self, cantidad=3):
+        for _ in range(cantidad):
             self.libres.append(await self.crear())
 
     async def new_context(self):
@@ -136,23 +137,58 @@ async def pausa(stop, segundos):
         pass
 
 
+async def procesar_fondo(store, ventanas):
+    """Una sola consulta de fondo; el bucle principal atiende peticiones en paralelo."""
+    try:
+        fila = await asyncio.to_thread(store.siguiente_fondo)
+        if fila is None:
+            return None
+        dni_id, dni = fila
+        etiqueta = f'fondo-ID-{dni_id}'
+        if not re.fullmatch(r'[0-9]{8}', dni):
+            registrar(etiqueta, 'DNI inválido; permanece pendiente.')
+            return False
+        respuesta, _, _ = await consultar(etiqueta, dni, ventanas)
+        grados, error = clasificar(respuesta)
+        if error:
+            registrar(etiqueta, f'{error}; permanece pendiente.')
+            return False
+        await asyncio.to_thread(store.finalizar_fondo, dni_id, dni, grados)
+        registrar(etiqueta, 'Guardado; PROCESADO_SUNEDU=1.')
+        return True
+    except Exception as exc:
+        mensaje = diagnostico_sql(exc) if isinstance(exc, pyodbc.Error) else f'Fallo de fondo ({type(exc).__name__}); permanece pendiente.'
+        registrar('fondo', mensaje)
+        return False
+
+
 async def servir(store, intervalo):
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     anterior = signal.signal(signal.SIGINT, lambda *_: loop.call_soon_threadsafe(stop.set))
+    anterior_term = signal.signal(signal.SIGTERM, lambda *_: loop.call_soon_threadsafe(stop.set))
     propietario = str(uuid4())
     # En este flujo, el otro programa administra PETICIONES_SUNEDU desde SQL.
     try:
         while not stop.is_set():
             tareas = set()
+            fondo = None
+            proximo_fondo = 0
             try:
-                async with AsyncCamoufox(headless=False, main_world_eval=True) as browser:
+                async with AsyncCamoufox(headless='virtual' if sys.platform.startswith('linux') else False, main_world_eval=True) as browser:
                     ventanas = Ventanas(browser)
-                    await ventanas.preparar()
+                    await ventanas.preparar(2)
+                    ventana_fondo = Ventanas(browser)
+                    await ventana_fondo.preparar(1)
+                    proxima_recarga_fondo = monotonic() + 300
                     limite = monotonic() + REINICIO_SEGUNDOS
                     registrar('servicio', 'Navegador disponible; Ctrl+C detiene la recepción.')
                     try:
                         while not stop.is_set() and monotonic() < limite and browser.is_connected():
+                            if fondo is not None and fondo.done():
+                                correcto = fondo.result()
+                                fondo = None
+                                proximo_fondo = monotonic() + (0 if correcto is True else intervalo if correcto is None else 60)
                             try:
                                 fila = await asyncio.to_thread(store.reclamar, propietario)
                             except Exception as exc:
@@ -166,11 +202,23 @@ async def servir(store, intervalo):
                                 tareas.add(tarea)
                                 tarea.add_done_callback(tareas.discard)
                             else:
-                                await pausa(stop, min(intervalo, max(0, limite - monotonic())))
+                                if not tareas and fondo is None and monotonic() >= proximo_fondo:
+                                    if monotonic() >= proxima_recarga_fondo:
+                                        _, pagina = ventana_fondo.libres[0]
+                                        await pagina.reload(wait_until='domcontentloaded', timeout=60000)
+                                        proxima_recarga_fondo = monotonic() + 300
+                                    fondo = asyncio.create_task(procesar_fondo(store, ventana_fondo))
+                                espera = min(intervalo, max(0, limite - monotonic()))
+                                if fondo is not None:
+                                    await asyncio.wait({fondo}, timeout=espera)
+                                else:
+                                    await pausa(stop, espera)
                     finally:
                         registrar('servicio', 'Esperando consultas y guardados pendientes.')
                         if tareas:
                             await asyncio.gather(*tareas)
+                        if fondo is not None:
+                            await fondo
                 if not stop.is_set():
                     registrar('servicio', 'Reiniciando navegador.')
             except Exception as exc:
@@ -181,6 +229,7 @@ async def servir(store, intervalo):
                     await pausa(stop, 5)
     finally:
         signal.signal(signal.SIGINT, anterior)
+        signal.signal(signal.SIGTERM, anterior_term)
     registrar('servicio', 'Detenido.')
 
 
